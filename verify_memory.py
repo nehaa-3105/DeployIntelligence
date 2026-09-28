@@ -8,7 +8,7 @@ Usage:
     py -3 verify_memory.py
 
 Requirements:
-    .env must contain HINDSIGHT_API_KEY and OPENAI_API_KEY.
+    .env must contain HINDSIGHT_API_KEY and GEMINI_API_KEY.
     Run `py -3 -m pip install -r requirements.txt` first if not installed.
 """
 

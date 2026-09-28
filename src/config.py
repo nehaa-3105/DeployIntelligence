@@ -9,8 +9,8 @@ Environment variables required:
     HINDSIGHT_API_KEY     — Hindsight Cloud authentication key
     HINDSIGHT_BASE_URL    — Hindsight API base URL (default: https://api.hindsight.vectorize.io)
     HINDSIGHT_BANK_ID     — Memory bank scoped to this project (default: deployment-memory)
-    OPENAI_API_KEY        — OpenAI authentication key
-    OPENAI_MODEL          — Model name to use for analysis (default: gpt-4o)
+    GEMINI_API_KEY        — Google Gemini API authentication key
+    GEMINI_MODEL          — Gemini model name (default: gemini-2.5-flash)
 """
 
 import os
@@ -36,9 +36,9 @@ class Settings:
             "HINDSIGHT_BANK_ID", "deployment-memory"
         )
 
-        # --- OpenAI ---
-        self.openai_api_key: str = self._require("OPENAI_API_KEY")
-        self.openai_model: str = os.environ.get("OPENAI_MODEL", "gpt-4o")
+        # --- Gemini ---
+        self.gemini_api_key: str = self._require("GEMINI_API_KEY")
+        self.gemini_model: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     @staticmethod
     def _require(key: str) -> str:

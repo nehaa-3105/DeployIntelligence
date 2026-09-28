@@ -1,7 +1,7 @@
 """
 LLM agent for Deployment Memory.
 
-Wraps OpenAI function-calling to produce structured risk assessments.
+Wraps Gemini to produce structured risk assessments.
 The agent never discovers matches — it only explains pre-matched evidence.
 
 Two tools exposed to the LLM:
@@ -22,5 +22,5 @@ The agent receives a strictly bounded context:
 Output is always a structured AnalysisResult — never free-form text.
 """
 
-# OpenAI client initialisation and tool/function-calling logic
+# Gemini client initialisation and tool/function-calling logic
 # to be implemented in the next step.

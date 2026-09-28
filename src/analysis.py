@@ -1,21 +1,409 @@
 """
 Deployment analysis orchestration for Deployment Memory.
 
-This is the only public interface consumed by the UI. It owns the
-end-to-end pipeline and coordinates memory.py, matching.py, and agent.py.
+This is the only public interface consumed by the UI and verification
+scripts. It owns the end-to-end pipeline and coordinates matching.py,
+memory.py, and the Gemini LLM.
 
-Public API:
-    analyze_deployment(deployment, mode) -> AnalysisResult
-        mode="baseline"  — no memory retrieval; generic LLM analysis only.
-        mode="memory"    — full retrieval pipeline; memory-informed analysis.
+Public API
+----------
+analyze_deployment(deployment, mode, historical_records) -> AnalysisResult
+    mode=AnalysisMode.BASELINE
+        Analyse using ONLY the proposed deployment's own structured fields.
+        Does NOT call Hindsight, does NOT retrieve historical deployments.
+        Exactly one LLM call.
 
-    record_outcome(deployment_id, outcome, incident) -> None
-        Called after a deployment "happens" (demo-triggered).
-        Stores the new outcome as a Hindsight memory entry so the next
-        analysis reflects it.
+    mode=AnalysisMode.MEMORY
+        Reuses Phase 3 matching + Hindsight retrieval to find historically
+        similar deployments. Passes retrieved evidence to exactly one LLM
+        call. LLM must cite evidence using deployment ID, outcome, root
+        cause, and prior mitigation/fix.
 
-Both modes return the same AnalysisResult schema so the UI can render
-them side-by-side without conditional logic.
+Both modes return the same AnalysisResult schema.
+
+LLM
+---
+Uses the official Google Gen AI SDK (google-genai):
+    client.models.generate_content(model, contents, config)
+API key is read from settings.gemini_api_key — never hardcoded.
+Exactly one Gemini call per mode. No chaining.
+
+record_outcome() is a stub for Phase 5 — not implemented here.
 """
 
-# Pipeline orchestration logic to be implemented in the next step.
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from google import genai
+from google.genai import types
+
+from src.config import settings
+from src.matching import find_similar
+from src.memory import close as hindsight_close
+from src.memory import ensure_bank_exists, retrieve_for_deployment
+from src.models import (
+    AnalysisMode,
+    AnalysisResult,
+    Deployment,
+    MatchSummary,
+    RelevantDeployment,
+)
+
+# ---------------------------------------------------------------------------
+# Gemini client setup (google-genai SDK)
+# ---------------------------------------------------------------------------
+
+_client = genai.Client(
+    api_key=settings.gemini_api_key,
+    http_options=types.HttpOptions(timeout=30000),
+)
+_MODEL = settings.gemini_model
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _deployment_fields_block(d: Deployment) -> str:
+    """
+    Render the structured fields of a Deployment as a compact text block
+    for inclusion in an LLM prompt. Only core fields are shown — optional
+    fields with None values are omitted.
+    """
+    lines = [
+        f"  deployment_id        : {d.deployment_id}",
+        f"  service              : {d.service}",
+        f"  migration_type       : {d.migration_type}",
+        f"  connection_pool_change: {d.connection_pool_change}",
+        f"  change_type          : {d.change_type}",
+        f"  timestamp            : {d.timestamp}",
+    ]
+    if d.dependencies_changed is not None:
+        lines.append(f"  dependencies_changed : {d.dependencies_changed}")
+    if d.config_changes:
+        lines.append(f"  config_changes       : {d.config_changes}")
+    if d.ci_result:
+        lines.append(f"  ci_result            : {d.ci_result}")
+    if d.notes:
+        lines.append(f"  notes                : {d.notes}")
+    return "\n".join(lines)
+
+
+def _parse_llm_json(content: str) -> dict[str, Any]:
+    """
+    Extract a JSON object from the LLM's response text.
+
+    The model sometimes wraps its output in a markdown code fence
+    (```json … ```). Strip the fence if present, then parse.
+    Raises ValueError if no valid JSON object is found.
+    """
+    # Strip markdown code fences if present
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    if fence_match:
+        return json.loads(fence_match.group(1))
+
+    # Try the whole response as JSON
+    brace_match = re.search(r"\{.*\}", content, re.DOTALL)
+    if brace_match:
+        return json.loads(brace_match.group(0))
+
+    raise ValueError(f"LLM response contained no JSON object:\n{content}")
+
+
+def _call_llm(system_prompt: str, user_prompt: str) -> str:
+    """
+    Single Gemini call using the google-genai SDK.
+
+    system_instruction is passed via GenerateContentConfig so it is
+    treated as a system turn, separate from the user contents.
+    Returns the generated text as a plain string.
+    """
+    response = _client.models.generate_content(
+        model=_MODEL,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0,
+        ),
+    )
+    return response.text
+
+
+# ---------------------------------------------------------------------------
+# BASELINE mode
+# ---------------------------------------------------------------------------
+
+_BASELINE_SYSTEM = """\
+You are a deployment risk analyst. You assess the risk of a proposed
+deployment based solely on its own technical fields. You have no access
+to historical deployment data and must NOT invent or imply historical
+incidents.
+
+Respond with a single JSON object — no markdown, no prose outside the
+object — with exactly these keys:
+
+{
+  "risk_assessment": "<low|medium|high>",
+  "summary": "<one-paragraph narrative explaining the risk level>",
+  "recommendation": "<concrete mitigation steps for this deployment>"
+}
+
+Base your assessment only on the fields provided. A connection pool change
+combined with a schema migration is inherently higher risk than a
+config-only change. Use engineering judgement grounded in the fields shown.
+"""
+
+
+def _analyze_baseline(deployment: Deployment) -> AnalysisResult:
+    """
+    BASELINE mode: exactly one LLM call using only the proposed deployment's
+    own structured fields. No Hindsight, no historical retrieval.
+    """
+    user_prompt = (
+        "Assess the risk of this proposed deployment:\n\n"
+        f"{_deployment_fields_block(deployment)}\n\n"
+        "Return only the JSON object described in your instructions."
+    )
+
+    raw = _call_llm(_BASELINE_SYSTEM, user_prompt)
+    parsed = _parse_llm_json(raw)
+
+    risk = parsed.get("risk_assessment", "medium")
+    summary = parsed.get("summary", "")
+    recommendation = parsed.get("recommendation", "")
+
+    return AnalysisResult(
+        mode=AnalysisMode.BASELINE,
+        risk_assessment=risk,
+        risk_level=risk,            # legacy alias
+        summary=summary,
+        reasoning=summary,          # legacy alias
+        recommendation=recommendation,
+        relevant_deployments=[],    # baseline never retrieves history
+        evidence="",                # baseline produces no evidence block
+        match_summary=None,
+        cited_deployment_ids=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# MEMORY-INFORMED mode
+# ---------------------------------------------------------------------------
+
+_MEMORY_SYSTEM = """\
+You are a deployment risk analyst with access to historical incident data.
+You must reason over the evidence provided and produce a risk assessment.
+
+Rules:
+- Cite historical deployments by their deployment ID, outcome, root cause
+  (when available), and prior mitigation/fix (when available).
+- Do NOT invent historical incidents, root causes, fixes, or outcomes.
+- If no historical evidence is available, say so explicitly.
+- Your risk_assessment must be "low", "medium", or "high".
+- cited_deployment_ids must only contain IDs present in the evidence block.
+
+Respond with a single JSON object — no markdown, no prose outside the
+object — with exactly these keys:
+
+{
+  "risk_assessment": "<low|medium|high>",
+  "summary": "<narrative that explicitly references the relevant historical deployments, their outcomes, root causes, and prior fixes>",
+  "recommendation": "<concrete mitigation steps informed by historical evidence>",
+  "evidence": "<concise summary of the historical evidence used, citing deployment ID, outcome, root cause, and fix for each cited incident>",
+  "cited_deployment_ids": ["<id>", ...]
+}
+"""
+
+
+def _build_evidence_block(match_summary: MatchSummary) -> str:
+    """
+    Render the historical candidates from a MatchSummary as a structured
+    evidence block for injection into the LLM prompt.
+
+    Only candidates that passed the >= 2 signal threshold are included.
+    For each candidate, Hindsight memory texts are included verbatim so
+    the LLM has the raw experiential evidence (root cause, resolution,
+    recovery notes).
+
+    The LLM is strictly instructed not to invent facts — it can only cite
+    what appears in this block.
+    """
+    if not match_summary.candidates:
+        return "No historically similar deployments found in the memory bank."
+
+    lines: list[str] = [
+        f"Total similar historical deployments : {match_summary.total_similar}",
+        f"Of which resulted in incidents        : {match_summary.total_incidents}",
+        f"Of which were successful              : {match_summary.total_successes}",
+        f"Historical risk confidence            : {match_summary.confidence_label}",
+        "",
+    ]
+
+    for cand in match_summary.candidates:
+        d = cand.deployment
+        lines.append(f"--- Deployment #{d.deployment_id} ---")
+        lines.append(f"  service              : {d.service}")
+        lines.append(f"  migration_type       : {d.migration_type}")
+        lines.append(f"  connection_pool_change: {d.connection_pool_change}")
+        lines.append(f"  change_type          : {d.change_type}")
+        lines.append(f"  outcome              : {d.outcome}")
+        lines.append(f"  similarity_score     : {cand.similarity_score}/5")
+        matched = [s.signal for s in cand.signal_matches if s.matched]
+        lines.append(f"  matched_signals      : {', '.join(matched)}")
+
+        if cand.hindsight_memories:
+            lines.append("  hindsight_evidence:")
+            for mem in cand.hindsight_memories:
+                text = mem.get("text", "").strip()
+                if text:
+                    lines.append(f"    - {text}")
+        else:
+            lines.append("  hindsight_evidence   : (none retrieved)")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _analyze_memory(
+    deployment: Deployment,
+    historical_records: list[Deployment],
+) -> AnalysisResult:
+    """
+    MEMORY-INFORMED mode: runs Phase 3 matching + Hindsight retrieval,
+    then passes the full evidence block to exactly one LLM call.
+
+    Hindsight client lifecycle
+    --------------------------
+    ensure_bank_exists() initialises the shared Hindsight client lazily.
+    hindsight_close() is called in a finally block so the aiohttp session
+    is closed cleanly even if the LLM call or JSON parsing raises — a failed
+    run cannot leave an open aiohttp connector behind.
+    """
+    ensure_bank_exists()
+
+    try:
+        # Phase 3 matching + Hindsight recall (reused verbatim — no modifications)
+        match_summary = find_similar(
+            proposed=deployment,
+            historical_records=historical_records,
+            recall_fn=retrieve_for_deployment,
+            threshold=2,
+        )
+    finally:
+        # Best-effort close — does not raise; see memory.close() docstring.
+        hindsight_close()
+
+    evidence_block = _build_evidence_block(match_summary)
+
+    user_prompt = (
+        "Proposed deployment to assess:\n\n"
+        f"{_deployment_fields_block(deployment)}\n\n"
+        "Historical evidence from memory:\n\n"
+        f"{evidence_block}\n"
+        "Return only the JSON object described in your instructions."
+    )
+
+    raw = _call_llm(_MEMORY_SYSTEM, user_prompt)
+    parsed = _parse_llm_json(raw)
+
+    risk = parsed.get("risk_assessment", "medium")
+    summary = parsed.get("summary", "")
+    recommendation = parsed.get("recommendation", "")
+    evidence_out = parsed.get("evidence", "")
+    cited_ids = parsed.get("cited_deployment_ids", [])
+    # Normalise: ensure all cited IDs are strings and appear in actual candidates
+    candidate_ids = {c.deployment.deployment_id for c in match_summary.candidates}
+    cited_ids = [str(cid) for cid in cited_ids if str(cid) in candidate_ids]
+
+    # Build RelevantDeployment list from matched candidates
+    relevant = [
+        RelevantDeployment(
+            deployment_id=c.deployment.deployment_id,
+            similarity_score=c.similarity_score,
+            outcome=c.deployment.outcome,
+            service=c.deployment.service,
+            migration_type=c.deployment.migration_type,
+        )
+        for c in match_summary.candidates
+    ]
+
+    return AnalysisResult(
+        mode=AnalysisMode.MEMORY,
+        risk_assessment=risk,
+        risk_level=risk,            # legacy alias
+        summary=summary,
+        reasoning=summary,          # legacy alias
+        recommendation=recommendation,
+        relevant_deployments=relevant,
+        evidence=evidence_out,
+        match_summary=match_summary,
+        cited_deployment_ids=cited_ids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+def analyze_deployment(
+    deployment: Deployment,
+    mode: AnalysisMode,
+    historical_records: list[Deployment] | None = None,
+) -> AnalysisResult:
+    """
+    Analyse a proposed deployment and return a structured risk assessment.
+
+    Parameters
+    ----------
+    deployment : Deployment
+        The proposed deployment to analyse. outcome should be "pending".
+    mode : AnalysisMode
+        AnalysisMode.BASELINE  — generic assessment, no memory retrieval.
+        AnalysisMode.MEMORY    — memory-informed assessment using Phase 3
+                                 matching and Hindsight recall.
+    historical_records : list[Deployment] | None
+        Required for MEMORY mode. The full list of known historical
+        deployments passed to find_similar(). Ignored in BASELINE mode.
+        If None in MEMORY mode, an empty list is used and the LLM will
+        report that no historical evidence is available.
+
+    Returns
+    -------
+    AnalysisResult
+        Structured result with mode, risk_assessment, summary,
+        recommendation, relevant_deployments, evidence, and — in MEMORY
+        mode — match_summary and cited_deployment_ids.
+
+    Raises
+    ------
+    ValueError
+        If mode is not a recognised AnalysisMode value.
+    google.genai.errors.APIError (subclasses)
+        Propagated directly if the Gemini call fails.
+    """
+    if mode == AnalysisMode.BASELINE:
+        return _analyze_baseline(deployment)
+    elif mode == AnalysisMode.MEMORY:
+        records = historical_records if historical_records is not None else []
+        return _analyze_memory(deployment, records)
+    else:
+        raise ValueError(f"Unrecognised analysis mode: {mode!r}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 stub — not implemented here
+# ---------------------------------------------------------------------------
+
+def record_outcome(
+    deployment_id: str,
+    outcome: str,
+    incident: object | None = None,
+) -> None:
+    """
+    Store a deployment outcome in Hindsight memory after it occurs.
+    Implemented in Phase 5 (outcome feedback). Not part of Phase 4.
+    """
+    raise NotImplementedError("record_outcome() is a Phase 5 feature.")

@@ -32,6 +32,10 @@ AnalysisMode
     Enum: "baseline" | "memory". Controls which path analyze_deployment()
     takes. Baseline ignores memory entirely; memory uses full retrieval.
 
+RelevantDeployment
+    Compact reference to a historically similar deployment cited in an
+    AnalysisResult. Populated only in MEMORY mode.
+
 AnalysisResult
     The output of analyze_deployment(). Same schema for both modes so the
     UI can render them side-by-side without branching.
@@ -189,21 +193,53 @@ class AnalysisMode(str, Enum):
     MEMORY = "memory"
 
 
+class RelevantDeployment(BaseModel):
+    """
+    Compact reference to a historically similar deployment included in an
+    AnalysisResult. Populated only in MEMORY mode; empty list in BASELINE.
+
+    Fields
+    ------
+    deployment_id   — unique identifier of the historical deployment
+    similarity_score — number of matched signals out of 5 (from matching)
+    outcome         — "incident" | "success"
+    service         — service name
+    migration_type  — migration type string
+    """
+
+    deployment_id: str
+    similarity_score: int
+    outcome: str
+    service: str
+    migration_type: str
+
+
 class AnalysisResult(BaseModel):
     """
     Output of analyze_deployment(). Same schema for both modes so the UI
     can render baseline and memory results side-by-side without branching.
 
     Fields populated in both modes:
-        mode, risk_level, reasoning, recommendation
+        mode, risk_assessment, summary, recommendation,
+        risk_level, reasoning
 
     Fields populated only in memory mode (empty/None in baseline):
-        match_summary, cited_deployment_ids
+        match_summary, cited_deployment_ids, relevant_deployments, evidence
     """
 
     mode: AnalysisMode
-    risk_level: str                     # "low" | "medium" | "high"
-    reasoning: str                      # LLM explanation
+
+    # Phase 4 canonical output fields (spec-required)
+    risk_assessment: str                # "low" | "medium" | "high"
+    summary: str                        # one-paragraph LLM narrative
     recommendation: str                 # LLM mitigation advice
+    relevant_deployments: list[RelevantDeployment] = Field(default_factory=list)
+    evidence: str                       # LLM-produced evidence summary; empty str in baseline
+
+    # Legacy aliases kept so nothing that already reads these breaks
+    risk_level: str                     # mirrors risk_assessment
+    reasoning: str                      # mirrors summary
+
+    # Memory-mode extras
     match_summary: MatchSummary | None = None
     cited_deployment_ids: list[str] = Field(default_factory=list)
