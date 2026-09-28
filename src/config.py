@@ -1,16 +1,20 @@
 """
 Configuration module for Deployment Memory.
 
-Loads all required environment variables from .env (via python-dotenv)
-and exposes them as a single typed Settings object. All other modules
-import from here — no module reads os.environ directly.
+Loads environment variables from .env (via python-dotenv) and exposes them
+as a single typed Settings object. All other modules import from here.
 
-Environment variables required:
+Required:
     HINDSIGHT_API_KEY     — Hindsight Cloud authentication key
-    HINDSIGHT_BASE_URL    — Hindsight API base URL (default: https://api.hindsight.vectorize.io)
-    HINDSIGHT_BANK_ID     — Memory bank scoped to this project (default: deployment-memory)
-    GEMINI_API_KEY        — Google Gemini API authentication key
-    GEMINI_MODEL          — Gemini model name (default: gemini-2.5-flash)
+
+Optional:
+    HINDSIGHT_BASE_URL    — default: https://api.hindsight.vectorize.io
+    HINDSIGHT_BANK_ID     — default: deployment-memory
+    OPENAI_API_KEY        — needed only when the LLM agent runs
+    OPENAI_MODEL          — default: gpt-4o
+    GEMINI_API_KEY        — not used by the API path; optional
+    GEMINI_MODEL          — default: gemini-2.5-flash
+    DATA_DIR              — directory for the JSON ledger; default: ./data
 """
 
 import os
@@ -22,12 +26,14 @@ load_dotenv()
 class Settings:
     """
     Typed container for all runtime configuration.
-    Raises ValueError at construction time if required variables are missing,
-    so misconfiguration surfaces immediately on startup rather than mid-run.
+
+    Only HINDSIGHT_API_KEY is mandatory; everything else has a sensible
+    default or is truly optional (raises AttributeError if accessed when
+    not set, so callers that need it discover the gap immediately).
     """
 
     def __init__(self) -> None:
-        # --- Hindsight ---
+        # --- Hindsight (required) ---
         self.hindsight_api_key: str = self._require("HINDSIGHT_API_KEY")
         self.hindsight_base_url: str = os.environ.get(
             "HINDSIGHT_BASE_URL", "https://api.hindsight.vectorize.io"
@@ -36,13 +42,20 @@ class Settings:
             "HINDSIGHT_BANK_ID", "deployment-memory"
         )
 
-        # --- Gemini ---
-        self.gemini_api_key: str = self._require("GEMINI_API_KEY")
+        # --- OpenAI (optional — only needed for LLM agent) ---
+        self.openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
+        self.openai_model: str = os.environ.get("OPENAI_MODEL", "gpt-4o")
+
+        # --- Gemini (optional — not used by the API path) ---
+        self.gemini_api_key: str = os.environ.get("GEMINI_API_KEY", "")
         self.gemini_model: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+        # --- Ledger ---
+        self.data_dir: str = os.environ.get("DATA_DIR", "./data")
 
     @staticmethod
     def _require(key: str) -> str:
-        """Return the value of an environment variable or raise if absent/empty."""
+        """Return the value of an env var or raise with a clear message."""
         value = os.environ.get(key, "").strip()
         if not value:
             raise ValueError(
