@@ -1,12 +1,12 @@
 /**
  * api.js — thin fetch wrapper for the Deployment Memory FastAPI backend.
  *
- * Base URL is read from VITE_API_BASE_URL env var.
+ * Base URL is read from VITE_API_URL env var.
  * In development (Vite proxy configured in vite.config.js) this is empty
  * and all requests go to the same origin, which Vite proxies to localhost:8000.
  */
 
-const BASE = import.meta.env.VITE_API_BASE_URL ?? ''
+const BASE = import.meta.env.VITE_API_URL ?? ''
 
 async function request(path, options = {}) {
   const url = `${BASE}${path}`
