@@ -12,6 +12,9 @@ venv/
 .venv/
 env/
 
+# Generated ledger data — never commit
+data/deployments.json
+
 # Test / temp output files
 verify_out.txt
 test_output.txt
@@ -28,3 +31,5 @@ frontend/.env
 # OS
 .DS_Store
 Thumbs.db
+data/deployments.backup.json
+verify_184.py

@@ -60,3 +60,19 @@ export function submitFeedback(payload) {
 export function checkHealth() {
   return request('/health')
 }
+
+/**
+ * GET /deployments
+ * @returns {Promise<Array>}
+ */
+export function getDeployments() {
+  return request('/deployments')
+}
+
+/**
+ * GET /memory/overview
+ * @returns {Promise<{memory_records, patterns, lessons, by_service}>}
+ */
+export function getMemoryOverview() {
+  return request('/memory/overview')
+}

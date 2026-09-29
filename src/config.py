@@ -10,10 +10,8 @@ Required:
 Optional:
     HINDSIGHT_BASE_URL    — default: https://api.hindsight.vectorize.io
     HINDSIGHT_BANK_ID     — default: deployment-memory
-    OPENAI_API_KEY        — needed only when the LLM agent runs
-    OPENAI_MODEL          — default: gpt-4o
-    GEMINI_API_KEY        — not used by the API path; optional
-    GEMINI_MODEL          — default: gemini-2.5-flash
+    GROQ_API_KEY          — used by the analysis LLM agent; optional at import time
+    GROQ_MODEL            — default: llama-3.3-70b-versatile
     DATA_DIR              — directory for the JSON ledger; default: ./data
 """
 
@@ -42,13 +40,9 @@ class Settings:
             "HINDSIGHT_BANK_ID", "deployment-memory"
         )
 
-        # --- OpenAI (optional — only needed for LLM agent) ---
-        self.openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
-        self.openai_model: str = os.environ.get("OPENAI_MODEL", "gpt-4o")
-
-        # --- Gemini (optional — not used by the API path) ---
-        self.gemini_api_key: str = os.environ.get("GEMINI_API_KEY", "")
-        self.gemini_model: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        # --- Groq (optional — used by the analysis LLM agent) ---
+        self.groq_api_key: str = os.environ.get("GROQ_API_KEY", "")
+        self.groq_model: str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
         # --- Ledger ---
         self.data_dir: str = os.environ.get("DATA_DIR", "./data")

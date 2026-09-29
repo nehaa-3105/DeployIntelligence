@@ -3,7 +3,7 @@ Deployment analysis orchestration for Deployment Memory.
 
 This is the only public interface consumed by the UI and verification
 scripts. It owns the end-to-end pipeline and coordinates matching.py,
-memory.py, and the Gemini LLM.
+memory.py, and the Groq LLM.
 
 Public API
 ----------
@@ -23,10 +23,10 @@ Both modes return the same AnalysisResult schema.
 
 LLM
 ---
-Uses the official Google Gen AI SDK (google-genai):
-    client.models.generate_content(model, contents, config)
-API key is read from settings.gemini_api_key — never hardcoded.
-Exactly one Gemini call per mode. No chaining.
+Uses the official Groq Python SDK:
+    client.chat.completions.create(model, messages)
+API key is read from settings.groq_api_key — never hardcoded.
+Exactly one Groq call per mode. No chaining.
 
 record_outcome() is a stub for Phase 5 — not implemented here.
 """
@@ -34,11 +34,12 @@ record_outcome() is a stub for Phase 5 — not implemented here.
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
 from typing import Any
 
-from google import genai
-from google.genai import types
+import groq as groq_sdk
 
 from src.config import settings
 from src.matching import find_similar
@@ -53,14 +54,11 @@ from src.models import (
 )
 
 # ---------------------------------------------------------------------------
-# Gemini client setup (google-genai SDK)
+# Groq client setup
 # ---------------------------------------------------------------------------
 
-_client = genai.Client(
-    api_key=settings.gemini_api_key,
-    http_options=types.HttpOptions(timeout=30000),
-)
-_MODEL = settings.gemini_model
+_client = groq_sdk.Groq(api_key=settings.groq_api_key)
+_MODEL  = settings.groq_model
 
 
 # ---------------------------------------------------------------------------
@@ -115,21 +113,83 @@ def _parse_llm_json(content: str) -> dict[str, Any]:
 
 def _call_llm(system_prompt: str, user_prompt: str) -> str:
     """
-    Single Gemini call using the google-genai SDK.
+    Single Groq chat-completion call.
 
-    system_instruction is passed via GenerateContentConfig so it is
-    treated as a system turn, separate from the user contents.
-    Returns the generated text as a plain string.
+    The system prompt is passed as the first message with role "system";
+    the user prompt follows with role "user".  Returns the assistant's
+    reply text as a plain string.
+
+    Retry policy
+    ------------
+    groq.InternalServerError (HTTP 5xx) is retried up to 5 total attempts
+    with exponential back-off plus ±25 % jitter:
+
+        attempt 1 → 2 : base 1 s  (~0.75–1.25 s)
+        attempt 2 → 3 : base 2 s  (~1.5–2.5 s)
+        attempt 3 → 4 : base 4 s  (~3.0–5.0 s)
+        attempt 4 → 5 : base 8 s  (~6.0–10.0 s)
+        total sleep budget : ~11–19 s across 4 gaps
+
+    groq.AuthenticationError / groq.BadRequestError / groq.PermissionDeniedError
+    / groq.NotFoundError (4xx) are never retried — they propagate immediately.
+
+    groq.RateLimitError is treated as transient and retried with the same
+    schedule (rate-limit spikes are usually brief on Groq's LPU infrastructure).
+
+    Any other exception propagates immediately.
+
+    No fallback model is used.
     """
-    response = _client.models.generate_content(
-        model=_MODEL,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0,
-        ),
+    _BASE_DELAYS  = (1, 2, 4, 8)   # 4 gaps → ~15 s total sleep for 5 attempts
+    _MAX_ATTEMPTS = 5
+
+    # Permanent 4xx error types — never retry these.
+    _PERMANENT = (
+        groq_sdk.AuthenticationError,
+        groq_sdk.BadRequestError,
+        groq_sdk.PermissionDeniedError,
+        groq_sdk.NotFoundError,
     )
-    return response.text
+    # Transient error types — retry with back-off.
+    _TRANSIENT = (
+        groq_sdk.InternalServerError,
+        groq_sdk.RateLimitError,
+    )
+
+    last_exc: Exception | None = None
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            completion = _client.chat.completions.create(
+                model=_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                temperature=0,
+            )
+            return completion.choices[0].message.content
+
+        except _PERMANENT:
+            # 4xx — configuration/auth error; never retry.
+            raise
+
+        except _TRANSIENT as exc:
+            # 5xx or rate-limit — retry with back-off.
+            last_exc = exc
+            if attempt == _MAX_ATTEMPTS - 1:
+                break  # exhausted; raise below
+
+            base   = _BASE_DELAYS[attempt]
+            jitter = base * random.uniform(-0.25, 0.25)
+            time.sleep(base + jitter)
+
+        except Exception:
+            # Network error, unexpected SDK error, etc. — not retryable.
+            raise
+
+    # All attempts exhausted on transient errors.
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +231,8 @@ def _analyze_baseline(deployment: Deployment) -> AnalysisResult:
     raw = _call_llm(_BASELINE_SYSTEM, user_prompt)
     parsed = _parse_llm_json(raw)
 
-    risk = parsed.get("risk_assessment", "medium")
-    summary = parsed.get("summary", "")
+    risk           = parsed.get("risk_assessment", "medium")
+    summary        = parsed.get("summary", "")
     recommendation = parsed.get("recommendation", "")
 
     return AnalysisResult(
@@ -306,14 +366,14 @@ def _analyze_memory(
         "Return only the JSON object described in your instructions."
     )
 
-    raw = _call_llm(_MEMORY_SYSTEM, user_prompt)
+    raw    = _call_llm(_MEMORY_SYSTEM, user_prompt)
     parsed = _parse_llm_json(raw)
 
-    risk = parsed.get("risk_assessment", "medium")
-    summary = parsed.get("summary", "")
+    risk           = parsed.get("risk_assessment", "medium")
+    summary        = parsed.get("summary", "")
     recommendation = parsed.get("recommendation", "")
-    evidence_out = parsed.get("evidence", "")
-    cited_ids = parsed.get("cited_deployment_ids", [])
+    evidence_out   = parsed.get("evidence", "")
+    cited_ids      = parsed.get("cited_deployment_ids", [])
     # Normalise: ensure all cited IDs are strings and appear in actual candidates
     candidate_ids = {c.deployment.deployment_id for c in match_summary.candidates}
     cited_ids = [str(cid) for cid in cited_ids if str(cid) in candidate_ids]
@@ -381,8 +441,8 @@ def analyze_deployment(
     ------
     ValueError
         If mode is not a recognised AnalysisMode value.
-    google.genai.errors.APIError (subclasses)
-        Propagated directly if the Gemini call fails.
+    groq.APIError (subclasses)
+        Propagated directly if the Groq call fails after all retries.
     """
     if mode == AnalysisMode.BASELINE:
         return _analyze_baseline(deployment)

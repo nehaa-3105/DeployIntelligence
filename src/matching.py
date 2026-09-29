@@ -210,6 +210,7 @@ def find_similar(
     historical_records: list[Deployment],
     recall_fn: Callable[[str, str], list[dict[str, Any]]],
     threshold: int = 2,
+    skip_same_id: bool = True,
 ) -> MatchSummary:
     """
     Full similarity pipeline: structured matching → Hindsight recall → ranking.
@@ -231,6 +232,12 @@ def find_similar(
     threshold : int
         Minimum similarity score to be considered a candidate. Default 2.
         Must not be set below 2 in production — 1-signal matches are noise.
+    skip_same_id : bool
+        When True (default), the proposed deployment's own record is excluded
+        from historical_records before scoring (matched by deployment_id).
+        When False, the proposed deployment may appear as its own candidate —
+        used for rerun after feedback so the deployment's own outcome is
+        factored into the analysis.
 
     Returns
     -------
@@ -241,8 +248,6 @@ def find_similar(
 
     Notes
     -----
-    - The proposed deployment itself is excluded from historical_records
-      before scoring (matched by deployment_id).
     - recall_fn is called with (query, deployment_id) so the memory layer
       can scope Hindsight recall to the specific candidate using tag filtering.
       This prevents one candidate's memories from appearing in another's
@@ -254,8 +259,9 @@ def find_similar(
     candidates: list[MatchCandidate] = []
 
     for historical in historical_records:
-        # Skip if this IS the proposed deployment (same ID)
-        if historical.deployment_id == proposed.deployment_id:
+        # Skip if this IS the proposed deployment (same ID), unless caller
+        # explicitly requests self-inclusion via skip_same_id=False.
+        if skip_same_id and historical.deployment_id == proposed.deployment_id:
             continue
 
         signal_matches = score_signals(proposed, historical)

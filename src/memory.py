@@ -9,10 +9,13 @@ Public API
 ensure_bank_exists() -> None
     Idempotent. Creates the Hindsight bank on first call; safe to call
     every startup. Must be called before store_deployment or retrieve_candidates.
+    Caches the successful initialisation so repeated calls within the same
+    process are instant no-ops.
 
 store_deployment(deployment_id, service, migration_type,
-                 connection_pool_change, outcome,
-                 root_cause, resolution, recovery_time_minutes) -> None
+                 connection_pool_change, outcome, change_type,
+                 dependencies_changed, root_cause, resolution,
+                 recovery_time_minutes, extra_notes) -> None
     Retains one deployment + outcome record as a natural-language memory
     entry. Structured fields are embedded inline in the sentence so
     Hindsight's fact-extraction picks them up for semantic recall.
@@ -20,8 +23,26 @@ store_deployment(deployment_id, service, migration_type,
 retrieve_candidates(query) -> list[dict]
     Recalls raw memory objects matching the query string.
     Returns a list of dicts, each with keys:
-        id, text, type, entities, context, mentioned_at
+        id, text, type, entities, context, mentioned_at, document_id, tags
     Does NOT synthesise or count — that is matching.py's job.
+
+retrieve_for_deployment(deployment_id, query, limit) -> list[dict]
+    Recalls memory objects scoped to a specific deployment.
+    Attribution priority:
+        1. tag  deployment:<id>         (canonical — checked first)
+        2. document_id == deployment:<id>
+        3. metadata.deployment_id == <id>
+        4. text fallback — only when text contains "Deployment <id> on"
+           AND does NOT contain "Deployment <other-id> on"
+    Rejects a memory if it explicitly identifies a different deployment
+    via tag, document_id, or metadata, even if the text would match.
+
+count_facts() -> int | None
+    Returns the total number of memory objects in the bank, using
+    client.list_memories().total. Returns None on any failure.
+
+close() -> None
+    Graceful shutdown of the aiohttp session.
 
 What Hindsight recall actually returns (confirmed via docs):
     A ranked list of raw memory objects, not synthesised summaries.
@@ -30,6 +51,7 @@ What Hindsight recall actually returns (confirmed via docs):
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -40,7 +62,9 @@ from src.config import settings
 # ---------------------------------------------------------------------------
 # Module-level client — initialised lazily via ensure_bank_exists()
 # ---------------------------------------------------------------------------
+
 _client: Hindsight | None = None
+_bank_initialised: bool = False   # cached so repeated calls are instant
 
 
 def _get_client() -> Hindsight:
@@ -58,7 +82,15 @@ def ensure_bank_exists() -> None:
     """
     Create the project memory bank if it does not already exist.
     Hindsight's create_bank is idempotent — safe to call on every startup.
+
+    Caches a successful initialisation in the module-level
+    ``_bank_initialised`` flag so that subsequent calls within the same
+    process are instant no-ops. This prevents the server from issuing a
+    bank-creation round-trip on every incoming request.
     """
+    global _bank_initialised
+    if _bank_initialised:
+        return
     client = _get_client()
     client.create_bank(
         bank_id=settings.hindsight_bank_id,
@@ -69,6 +101,7 @@ def ensure_bank_exists() -> None:
             "deployments that resemble past incidents."
         ),
     )
+    _bank_initialised = True
 
 
 def store_deployment(
@@ -78,6 +111,8 @@ def store_deployment(
     migration_type: str,
     connection_pool_change: bool,
     outcome: str,
+    change_type: str = "",
+    dependencies_changed: bool | None = None,
     root_cause: str = "",
     resolution: str = "",
     recovery_time_minutes: int = 0,
@@ -86,16 +121,15 @@ def store_deployment(
     """
     Retain one deployment record in Hindsight memory.
 
-    The record is stored as a single descriptive sentence so Hindsight's
+    The record is stored as a natural-language sentence so Hindsight's
     fact-extraction picks up the structured signals for semantic recall.
+    ``change_type`` and ``dependencies_changed`` are included so the
+    full 5-signal match context is embedded in the retained text.
 
     Tags
     ----
     Every retained memory is tagged with "deployment:{deployment_id}".
-    This tag is used by retrieve_for_deployment() to scope recall to a
-    specific deployment, preventing one candidate's memories from
-    appearing in another candidate's evidence.
-
+    This tag is the canonical scoping mechanism for retrieve_for_deployment().
     Tags must be applied at retain time — they cannot be added retroactively.
     If you re-seed the bank, clear it first to avoid untagged stale memories.
 
@@ -111,6 +145,10 @@ def store_deployment(
         Whether the deployment changed connection pool settings.
     outcome : str
         "incident" or "success".
+    change_type : str
+        Structural change category — "infra" | "config" | "code" | "schema".
+    dependencies_changed : bool | None
+        Whether upstream/downstream service dependencies were changed.
     root_cause : str
         For incidents: short description of root cause.
     resolution : str
@@ -122,11 +160,16 @@ def store_deployment(
     """
     client = _get_client()
 
-    # Build the natural-language sentence that Hindsight will extract facts from.
     pool_phrase = (
         "included a connection pool change" if connection_pool_change
         else "did not change the connection pool"
     )
+
+    change_ctx = ""
+    if change_type:
+        change_ctx += f" change_type={change_type}"
+    if dependencies_changed is not None:
+        change_ctx += f", dependencies_changed={dependencies_changed}"
 
     if outcome == "incident":
         outcome_sentence = (
@@ -140,25 +183,17 @@ def store_deployment(
 
     content = (
         f"Deployment {deployment_id} on {service} performed a {migration_type} migration "
-        f"and {pool_phrase}. "
-        f"{outcome_sentence}"
+        f"and {pool_phrase}."
     )
+    if change_ctx:
+        content += f" Structured signals:{change_ctx}."
+    content += f" {outcome_sentence}"
     if extra_notes:
         content += f" Additional context: {extra_notes}"
 
     client.retain(
         bank_id=settings.hindsight_bank_id,
         content=content,
-        # document_id groups all retained content for this deployment into one
-        # logical document. RecallResult objects carry document_id back in the
-        # recall response, so retrieve_for_deployment() can post-filter results
-        # by document_id to guarantee candidate-specific retrieval.
-        #
-        # Tags are also set for belt-and-suspenders, but the primary scoping
-        # mechanism is document_id because Hindsight's extracted fact records
-        # reliably carry document_id back on recall; tags on extracted facts
-        # are not reliably returned (confirmed: tags=None / excluded_none=True
-        # on RecallResult objects from the server).
         document_id=f"deployment:{deployment_id}",
         tags=[f"deployment:{deployment_id}"],
         metadata={
@@ -179,19 +214,11 @@ def retrieve_candidates(query: str, limit: int = 10) -> list[dict[str, Any]]:
     compatibility with the Phase 2 verification script and any caller
     that does not have a specific deployment_id to scope by.
 
-    For candidate-specific retrieval (one candidate per recall call)
-    use retrieve_for_deployment() instead — it scopes by deployment tag
-    and guarantees one candidate's memories cannot appear in another's.
-
     Returns a plain list of dicts (not Hindsight model objects) so callers
     never take a direct dependency on the hindsight_client type hierarchy.
 
     Each dict contains:
-        id, text, type, entities, context, mentioned_at
-
-    Confirmed SDK signature (hindsight-client==0.10.0):
-        recall(bank_id, query, types=None, max_tokens=4096, budget="mid", ...)
-        No `limit` parameter — token budget controls result volume.
+        id, text, type, entities, context, mentioned_at, document_id, tags
     """
     client = _get_client()
     approx_max_tokens = min(limit * 512, 4096)
@@ -218,6 +245,10 @@ def retrieve_candidates(query: str, limit: int = 10) -> list[dict[str, Any]]:
     return memories
 
 
+# Pre-compiled pattern for text fallback: matches "Deployment 184 on"
+_DEP_TEXT_PATTERN = re.compile(r"\bDeployment\s+(\d+)\s+on\b", re.IGNORECASE)
+
+
 def retrieve_for_deployment(
     deployment_id: str,
     query: str,
@@ -226,33 +257,31 @@ def retrieve_for_deployment(
     """
     Recall memory objects scoped to a specific deployment.
 
-    Mechanism: Python-side tag filter
-    ----------------------------------
-    store_deployment() tags every retained memory with
-    "deployment:{deployment_id}". Some of Hindsight's server-side extracted
-    fact/observation records carry this tag back in the RecallResult.tags
-    field; others have tags=[] or tags=None (ambiguous — cannot be attributed
-    to any deployment with certainty).
+    Attribution priority (first matching rule wins):
+    ─────────────────────────────────────────────────
+    1. tag  ``deployment:<id>``  is present in mem.tags
+       → ACCEPT unconditionally.
 
-    This function performs an unscoped semantic recall (wider token budget for
-    headroom) and then post-filters in Python:
-        KEEP   if deployment_tag in (mem.tags or [])
-        DISCARD if tags is None or [] — unattributable, treated as ambiguous
+    2. document_id == ``deployment:<id>``
+       → ACCEPT.
 
-    Why not document_id?
-    --------------------
-    document_id is unreliable as a scoping key: some recalled records have
-    document_id=None, some have UUID document_ids, and only some have the
-    expected "deployment:{id}" value. Confirmed from diagnostic output.
+    3. metadata.deployment_id == ``<id>``
+       → ACCEPT.
 
-    Why not server-side tags_match="any_strict"?
-    --------------------------------------------
-    tags_match="any_strict" returns 0 results for all candidates — the
-    server excludes untagged extracted memories, but our best records have
-    tags=[] (not the deployment tag), so they too get excluded.
+    Rejection rules (checked before text fallback):
+    ─────────────────────────────────────────────────
+    If none of the above matched, the memory is a candidate for text
+    fallback ONLY IF it does not carry explicit attribution to a DIFFERENT
+    deployment:
+        - any tag matching ``deployment:<other-id>``  → REJECT
+        - document_id matching ``deployment:<other-id>``  → REJECT
+        - metadata.deployment_id != <id> (and not empty)  → REJECT
 
-    The Python-side filter is the most reliable approach given the actual
-    data: it uses the tags that ARE present and discards ambiguous records.
+    Text fallback (only when all explicit-attribution checks pass):
+    ─────────────────────────────────────────────────────────────────
+    Accept if text contains ``Deployment <id> on``  AND  the text does
+    NOT also contain ``Deployment <other-id> on`` for any other numeric
+    ID.  A bare ``#184`` without the canonical phrase is not sufficient.
 
     Parameters
     ----------
@@ -268,8 +297,8 @@ def retrieve_for_deployment(
     client = _get_client()
     deployment_tag = f"deployment:{deployment_id}"
 
-    # Use a wider budget so that even if many results are filtered out,
-    # we still have enough deployment-tagged records to return.
+    # Wider budget so that even if many results are filtered, we still
+    # have enough deployment-tagged records to return.
     approx_max_tokens = min(limit * 4 * 512, 4096)
 
     result = client.recall(
@@ -280,28 +309,88 @@ def retrieve_for_deployment(
     )
 
     memories: list[dict[str, Any]] = []
+
     for mem in result.results:
-        # tags is Optional[list[str]] — None means not set, [] means explicitly
-        # empty. Neither can be attributed to this deployment.
         raw_tags: list[str] | None = getattr(mem, "tags", None)
-        if not raw_tags:          # None or empty list — skip
-            continue
-        if deployment_tag not in raw_tags:
-            continue              # tagged, but for a different deployment
+        tags: list[str] = raw_tags if raw_tags else []
+        doc_id: str | None = getattr(mem, "document_id", None)
+        metadata: dict = getattr(mem, "metadata", None) or {}
+        text: str = getattr(mem, "text", "") or ""
+
+        # ── Priority 1: explicit tag ─────────────────────────────────────
+        if deployment_tag in tags:
+            attribution = "tag"
+
+        # ── Priority 2: document_id ──────────────────────────────────────
+        elif doc_id == deployment_tag:
+            attribution = "document_id"
+
+        # ── Priority 3: metadata.deployment_id ──────────────────────────
+        elif str(metadata.get("deployment_id", "")) == deployment_id:
+            attribution = "metadata"
+
+        else:
+            # ── Rejection before text fallback ───────────────────────────
+            # If any explicit field points to a DIFFERENT deployment, reject.
+            other_dep_tag = any(
+                t.startswith("deployment:") and t != deployment_tag
+                for t in tags
+            )
+            if other_dep_tag:
+                continue
+
+            if doc_id and doc_id.startswith("deployment:") and doc_id != deployment_tag:
+                continue
+
+            meta_dep = str(metadata.get("deployment_id", ""))
+            if meta_dep and meta_dep != deployment_id:
+                continue
+
+            # ── Text fallback ────────────────────────────────────────────
+            # Accept only if text contains "Deployment <id> on"
+            # AND contains no "Deployment <other-id> on" for any other id.
+            ids_in_text = _DEP_TEXT_PATTERN.findall(text)
+            if not ids_in_text:
+                continue                  # no deployment mentioned in text
+            if deployment_id not in ids_in_text:
+                continue                  # this deployment not mentioned
+            other_ids = [i for i in ids_in_text if i != deployment_id]
+            if other_ids:
+                continue                  # another deployment also mentioned
+            attribution = "text"
 
         memories.append({
             "id": getattr(mem, "id", None),
-            "text": getattr(mem, "text", ""),
+            "text": text,
             "type": getattr(mem, "type", ""),
             "entities": getattr(mem, "entities", []),
             "context": getattr(mem, "context", ""),
             "mentioned_at": str(getattr(mem, "mentioned_at", "")),
-            "document_id": getattr(mem, "document_id", None),
+            "document_id": doc_id,
             "tags": raw_tags,
+            "_attribution": attribution,   # diagnostic — stripped by verify only
         })
+
         if len(memories) >= limit:
             break
+
     return memories
+
+
+def count_facts() -> int | None:
+    """
+    Return the total number of memory objects stored in the bank.
+
+    Uses ``client.list_memories(bank_id).total``.
+    Returns ``None`` on any failure (network error, SDK version mismatch, etc.)
+    so callers can distinguish "zero facts" from "call failed".
+    """
+    try:
+        client = _get_client()
+        result = client.list_memories(bank_id=settings.hindsight_bank_id)
+        return result.total
+    except Exception:
+        return None
 
 
 def close() -> None:
@@ -317,7 +406,7 @@ def close() -> None:
     sleep(0) is insufficient — _wait_for_close has multiple await points.
     250ms is the value from aiohttp's own graceful-shutdown documentation.
     """
-    global _client
+    global _client, _bank_initialised
     if _client is None:
         return
 
@@ -326,7 +415,7 @@ def close() -> None:
 
     async def _aclose_with_drain() -> None:
         await _client.aclose()          # type: ignore[union-attr]
-        await asyncio.sleep(0.250)      # let _wait_for_close finish
+        await asyncio.sleep(0.250)
 
     try:
         _run_async(_aclose_with_drain())
@@ -334,3 +423,4 @@ def close() -> None:
         pass  # best-effort; don't crash on shutdown
 
     _client = None
+    _bank_initialised = False  # reset so a new client can re-initialise
