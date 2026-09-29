@@ -49,10 +49,11 @@ _LOCALHOST_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
+    "https://deploy-intelligence.vercel.app",
 ]
 
 def _cors_origins() -> list[str]:
-    """Read CORS_ORIGINS from env (comma-separated) and merge with localhost defaults."""
+    """Read CORS_ORIGINS from env (comma-separated) and merge with known origins."""
     raw = os.environ.get("CORS_ORIGINS", "")
     extra = [o.strip() for o in raw.split(",") if o.strip()]
     combined = list({*_LOCALHOST_ORIGINS, *extra})
