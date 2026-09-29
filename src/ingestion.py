@@ -397,6 +397,36 @@ def run_ingestion(wait_seconds: int = 3, reset: bool = False) -> None:
         )
 
 
+def bootstrap_ledger_if_empty() -> None:
+    """
+    Reconstruct the local ledger from SEED_RECORDS when it is missing or empty.
+
+    Called at API server startup so that Render's ephemeral filesystem is
+    always populated with the 10 canonical historical records, even after a
+    fresh deploy wipes the disk.
+
+    Rules
+    -----
+    - Does NOT call Hindsight retain() — the production bank is assumed to
+      already contain these memories from the one-time seed run.
+    - Does NOT reset or delete the Hindsight bank.
+    - Does NOT create duplicate memories in Hindsight.
+    - Sets retained_in_hindsight=True on every bootstrapped record, because
+      the corresponding memories are already in the production bank.
+    - Uses store.seed_from_records() which skips IDs already present, so
+      any records written by /feedback after a prior deploy are preserved.
+    - Idempotent: if the ledger is non-empty the function returns immediately.
+    """
+    from src.store import load_all, seed_from_records
+
+    if load_all():
+        # Ledger already has records — nothing to do.
+        return
+
+    records = [_ledger_record(rec, retained=True) for rec in SEED_RECORDS]
+    seed_from_records(records)
+
+
 if __name__ == "__main__":
     reset_flag = "--reset" in sys.argv
     run_ingestion(reset=reset_flag)

@@ -68,6 +68,17 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Startup bootstrap — reconstruct local ledger on Render's ephemeral FS
+# ---------------------------------------------------------------------------
+# Render wipes the filesystem on every deploy.  This call writes the 10
+# canonical SEED_RECORDS into data/deployments.json when the file is missing
+# or empty, so /memory/overview and /deployments are never empty on a fresh
+# instance.  It is a pure ledger write — it does NOT call Hindsight retain()
+# and does NOT touch the production Hindsight bank.
+from src.ingestion import bootstrap_ledger_if_empty as _bootstrap
+_bootstrap()
+
+# ---------------------------------------------------------------------------
 # Signal legend — the five canonical matching signals
 # ---------------------------------------------------------------------------
 
